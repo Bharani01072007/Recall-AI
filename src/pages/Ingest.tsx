@@ -100,6 +100,42 @@ export default function Ingest() {
     return chunks;
   };
 
+  const extractEventsFromText = async (content: string) => {
+    if (!geminiKey) return [];
+    
+    try {
+      const prompt = `
+        You are an AI assistant that extracts scheduled events from text.
+        Given the following text, identify any Meetings, Deadlines, Reminders, or Announcements.
+        Return the results as a JSON array of objects with these fields:
+        - title: Short, descriptive title
+        - description: Brief details
+        - event_type: One of "Meeting", "Deadline", "Reminder", "Announcement"
+        - event_date: ISO 8601 date string (estimate if only month/day provided, use current year 2026 if unknown)
+
+        If no events are found, return an empty array [].
+        Text: "${content.substring(0, 10000)}"
+      `;
+
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { response_mime_type: "application/json" }
+        })
+      });
+
+      if (!response.ok) throw new Error("Gemini Extraction failed");
+      const data = await response.json();
+      const resultText = data.candidates[0].content.parts[0].text;
+      return JSON.parse(resultText) || [];
+    } catch (err) {
+      console.error("Extraction error:", err);
+      return [];
+    }
+  };
+
   const sendData = async () => {
     if (!text.trim()) return;
     if (!geminiKey) {
@@ -145,15 +181,32 @@ export default function Ingest() {
 
       if (chunksError) throw chunksError;
 
-      // 3. Create Event Entry for Dashboard
-      await supabase.from("events").insert({
-        title: `Ingested to Brain: ${file?.name || "Knowledge Note"}`,
-        description: `Stored in dedicated knowledge tables and ready for instant recall.`,
-        event_type: "Reminder",
-        event_date: new Date().toISOString(),
-        source: "RecallAI Brain",
-        document_id: doc.id
-      });
+      // 3. Extract and Create Event Entries
+      toast.info("Extracting events and insights...");
+      const detectedEvents = await extractEventsFromText(text);
+      
+      if (detectedEvents && detectedEvents.length > 0) {
+        const eventInserts = detectedEvents.map((ev: any) => ({
+          title: ev.title,
+          description: ev.description || `Extracted from ${file?.name || "Knowledge"}`,
+          event_type: ev.event_type || "Reminder",
+          event_date: ev.event_date || new Date().toISOString(),
+          source: "RecallAI Brain (AI Extracted)",
+          document_id: doc.id
+        }));
+        await supabase.from("events").insert(eventInserts);
+        toast.success(`Successfully extracted ${detectedEvents.length} events!`);
+      } else {
+        // Fallback: Generic Event Entry
+        await supabase.from("events").insert({
+          title: `Ingested to Brain: ${file?.name || "Knowledge Note"}`,
+          description: `Stored in dedicated knowledge tables and ready for instant recall.`,
+          event_type: "Reminder",
+          event_date: new Date().toISOString(),
+          source: "RecallAI Brain",
+          document_id: doc.id
+        });
+      }
 
       setSuccess(true);
       setText("");
