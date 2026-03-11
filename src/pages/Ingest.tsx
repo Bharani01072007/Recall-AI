@@ -5,6 +5,14 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
+import { 
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+} from "@/components/ui/dialog";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { motion, AnimatePresence } from "framer-motion";
 import { toast } from "sonner";
 import { supabase as supabaseClient } from "@/integrations/supabase/client";
@@ -22,9 +30,10 @@ export default function Ingest() {
   const [searching, setSearching] = useState(false);
   const [results, setResults] = useState<{ content: string; similarity: number }[]>([]);
   
-  // Knowledge Hub State
   const [storedDocs, setStoredDocs] = useState<any[]>([]);
   const [loadingDocs, setLoadingDocs] = useState(true);
+  const [selectedDoc, setSelectedDoc] = useState<any | null>(null);
+  const [fetchingContent, setFetchingContent] = useState(false);
 
   // Embedding model state (Gemini API)
   const geminiKey = import.meta.env.VITE_GEMINI_API_KEY;
@@ -38,6 +47,30 @@ export default function Ingest() {
       .limit(10);
     if (!error && data) setStoredDocs(data);
     setLoadingDocs(false);
+  };
+
+  const handleSelectDoc = async (doc: any) => {
+    setSelectedDoc({ ...doc, content: "" }); // Open modal immediately with empty content
+    setFetchingContent(true);
+    
+    try {
+      const { data, error } = await supabase
+        .from("brain_knowledge_vectors")
+        .select("content")
+        .eq("knowledge_id", doc.id)
+        .order("created_at", { ascending: true }); // Using created_at for ordering chunks
+
+      if (error) throw error;
+      
+      const fullContent = (data || []).map((row: any) => row.content).join("");
+      setSelectedDoc({ ...doc, content: fullContent });
+    } catch (err: any) {
+      console.error("FAILED TO FETCH DOCUMENT CONTENT:", err);
+      toast.error("Could not retrieve document content.");
+      setSelectedDoc(null);
+    } finally {
+      setFetchingContent(false);
+    }
   };
 
   useEffect(() => {
@@ -117,7 +150,7 @@ export default function Ingest() {
         Text: "${content.substring(0, 10000)}"
       `;
 
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`, {
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -126,12 +159,18 @@ export default function Ingest() {
         })
       });
 
-      if (!response.ok) throw new Error("Gemini Extraction failed");
+      if (!response.ok) {
+        const errData = await response.json();
+        console.error("Gemini Extraction HTTP Error:", errData);
+        throw new Error("Gemini Extraction failed");
+      }
       const data = await response.json();
       const resultText = data.candidates[0].content.parts[0].text;
-      return JSON.parse(resultText) || [];
+      console.log("RAW EXTRACTION RESULT:", resultText);
+      const parsed = JSON.parse(resultText);
+      return Array.isArray(parsed) ? parsed : [];
     } catch (err) {
-      console.error("Extraction error:", err);
+      console.error("Extraction error details:", err);
       return [];
     }
   };
@@ -291,19 +330,18 @@ export default function Ingest() {
 
   const deleteDoc = async (id: string) => {
     try {
-      // 1. Delete children from brain tables
-      const { error: chunkError } = await supabase.from("brain_knowledge_vectors").delete().eq("knowledge_id", id);
-      if (chunkError) throw chunkError;
+      // 1. Delete associated vectors
+      await supabase.from("brain_knowledge_vectors").delete().eq("knowledge_id", id);
+      
+      // 2. Delete associated extracted events
+      await supabase.from("events").delete().eq("document_id", id);
 
-      const { error: eventError } = await supabase.from("events").delete().eq("document_id", id);
-      if (eventError) throw eventError;
-
-      // 2. Delete main knowledge record
-      const { error: docError } = await supabase.from("brain_knowledge").delete().eq("id", id);
-      if (docError) throw docError;
-
-      setStoredDocs(prev => prev.filter(d => d.id !== id));
-      toast.success("Knowledge removed from brain tables.");
+      // 3. Delete the knowledge record
+      const { error } = await supabase.from("brain_knowledge").delete().eq("id", id);
+      
+      if (error) throw error;
+      toast.success("Document and related AI data removed from brain.");
+      fetchStoredDocs();
     } catch (err: any) {
       console.error("DELETE ERROR:", err);
       toast.error(`Deletion Failed: ${err.message}`);
@@ -462,7 +500,11 @@ export default function Ingest() {
              </div>
           ) : (
             storedDocs.map((doc) => (
-              <Card key={doc.id} className="shadow-none border-muted/50 hover:border-primary/20 transition-colors group">
+              <Card 
+                key={doc.id} 
+                className="shadow-none border-muted/50 hover:border-primary/20 transition-colors group cursor-pointer"
+                onClick={() => handleSelectDoc(doc)}
+              >
                 <CardContent className="p-4 flex items-center justify-between">
                   <div className="flex items-center gap-3 overflow-hidden">
                     <div className="p-2 bg-primary/5 rounded-lg">
@@ -477,7 +519,10 @@ export default function Ingest() {
                     variant="ghost" 
                     size="icon" 
                     className="h-8 w-8 text-destructive opacity-0 group-hover:opacity-100 transition-opacity"
-                    onClick={() => deleteDoc(doc.id)}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      deleteDoc(doc.id);
+                    }}
                   >
                     <Trash2 className="h-4 w-4" />
                   </Button>
@@ -486,7 +531,55 @@ export default function Ingest() {
             ))
           )}
         </div>
+
+        <div className="mt-8 flex items-center justify-between">
+          <p className="text-xs text-muted-foreground italic">Note: "Stored Contexts" count includes your Q&A history.</p>
+          <Button 
+            variant="outline" 
+            size="sm" 
+            className="text-destructive border-destructive/20 hover:bg-destructive/5"
+            onClick={async () => {
+              if (confirm("Clear all Q&A and search history?")) {
+                const { error } = await supabase.from("brain_qa_history").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+                if (!error) toast.success("Q&A history cleared.");
+                else toast.error("Failed to clear history.");
+              }
+            }}
+          >
+            Clear Q&A History
+          </Button>
+        </div>
       </div>
+
+      <Dialog open={!!selectedDoc} onOpenChange={(open) => !open && setSelectedDoc(null)}>
+        <DialogContent className="max-w-3xl max-h-[80vh] flex flex-col glass border-emerald-500/20">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <FileText className="h-5 w-5 text-primary" />
+              {selectedDoc?.name || "Document Preview"}
+            </DialogTitle>
+            <DialogDescription>
+              Stored on {selectedDoc && new Date(selectedDoc.created_at).toLocaleString()}
+            </DialogDescription>
+          </DialogHeader>
+          <ScrollArea className="flex-1 mt-4 rounded-md border border-emerald-500/10 p-4 bg-muted/20">
+            <div className="text-sm leading-relaxed whitespace-pre-wrap font-sans text-foreground/90 py-2">
+              {fetchingContent ? (
+                <div className="flex flex-col items-center justify-center py-20 gap-3 opacity-40">
+                  <Loader2 className="h-8 w-8 animate-spin" />
+                  <p className="text-xs">Reconstructing document...</p>
+                </div>
+              ) : selectedDoc?.content ? (
+                selectedDoc.content
+              ) : (
+                <div className="text-center py-20 opacity-40 italic">
+                  No content available for this entry.
+                </div>
+              )}
+            </div>
+          </ScrollArea>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
